@@ -17,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	
 
 	"github.com/miekg/dns"
 	"github.com/oraoto/go-pidfd"
@@ -36,6 +37,16 @@ var tracee struct {
 
 // SyscallHandler defines the handler function for a syscall notification.
 type SyscallHandler func(fd libseccomp.ScmpFd, req *libseccomp.ScmpNotifReq) (val uint64, errno int32, flags uint32)
+const (
+    // DNS_PORT is the standard DNS port number
+    DNS_PORT = 53
+    
+    // DNS_HEADER_SIZE is the size of a DNS message header
+    DNS_HEADER_SIZE = 12
+    
+    // UDP_MAX_PAYLOAD is the maximum UDP payload size
+    UDP_MAX_PAYLOAD = 512
+)
 
 var (
 	socksTCPv4        string
@@ -306,7 +317,7 @@ func initSeccomp() chan <-struct{} {
 	}
 	logger.Info().Msgf("Seccomp filter loaded with notification FD: %v", fd)
 
-	handlers := map[string]SyscallHandler{"connect": HandleConnect, "sendto": HandleSendto, "bind": HandleBind, "listen": HandleListen, "sendmsg": HandleSendmsg, "sendmmsg": HandleSendmsg}
+	handlers := map[string]SyscallHandler{"connect": HandleConnect, "sendto": HandleSendto, "bind": HandleBind, "listen": HandleListen, "sendmsg": HandleSendmsg, "sendmmsg": HandleSendmsg, "writev": HandleWritev}
 
 	stop, errChan := Handle(fd, handlers)
 	go func() {
@@ -503,39 +514,74 @@ func Handle(fd libseccomp.ScmpFd, handlers map[string]SyscallHandler) (chan<- st
 
 // HandleConnect is a syscall handler for connect.
 func HandleConnect(seccompNotifFd libseccomp.ScmpFd, req *libseccomp.ScmpNotifReq) (uint64, int32, uint32) {
-	logger.Info().Msgf("Intercepted 'connect' syscall from PID %d", req.Pid)
+    logger.Info().Msgf("Intercepted 'connect' syscall from PID %d", req.Pid)
 
-	err := libseccomp.NotifIDValid(seccompNotifFd, req.ID)
-	if err != nil {
-		logger.Fatal().Msgf("failed to validate notification ID: %v", err)
-	}
+    err := libseccomp.NotifIDValid(seccompNotifFd, req.ID)
+    if err != nil {
+        logger.Fatal().Msgf("failed to validate notification ID: %v", err)
+    }
 
-	memFile := fmt.Sprintf("/proc/%d/mem", req.Pid)
-	mem, err := os.Open(memFile)
-	if err != nil {
-		logger.Fatal().Msgf("failed to open memory file: %v", err)
-	}
-	defer mem.Close()
+    memFile := fmt.Sprintf("/proc/%d/mem", req.Pid)
+    mem, err := os.Open(memFile)
+    if err != nil {
+        logger.Fatal().Msgf("failed to open memory file: %v", err)
+    }
+    defer mem.Close()
 
-	// Read the syscall arguments
-	data := make([]byte, req.Data.Args[2])
-	_, err = syscall.Pread(int(mem.Fd()), data, int64(req.Data.Args[1]))
-	if err != nil {
-		logger.Fatal().Msgf("failed to read memory: %v", err)
-	}
+    data := make([]byte, req.Data.Args[2])
+    _, err = syscall.Pread(int(mem.Fd()), data, int64(req.Data.Args[1]))
+    if err != nil {
+        logger.Fatal().Msgf("failed to read memory: %v", err)
+    }
 
-	// Parse the address
-	addr, err := ParseAddress(data)
-	if err != nil {
-		logger.Fatal().Msgf("failed to parse address: %v", err)
-	}
+    addr, err := ParseAddress(data)
+    if err != nil {
+        logger.Fatal().Msgf("failed to parse address: %v", err)
+    }
 
-	sockfd := req.Data.Args[0]
-	pid := req.Pid
+    // Check if this is a TCP DNS connection
+    if addr.Port == 53 && (addr.Family == unix.AF_INET || addr.Family == unix.AF_INET6) {
+        if proxydns {
+            logger.Info().Msgf("Intercepting DNS TCP connection to %s", addr.String())
+            return handleTCPDNS(req.Pid, req.Data.Args[0], addr)
+        }
+    }
 
-	return handleIPEvent(sockfd, pid, addr)
+    return handleIPEvent(req.Data.Args[0], req.Pid, addr)
 }
 
+func handleTCPDNS(pid uint32, fd uint64, addr FullAddress) (uint64, int32, uint32) {
+    tgid, err := getTgid(pid)
+    if err != nil {
+        logger.Fatal().Msgf("Error getting tgid: %v", err)
+    }
+
+    pfd, err := pidfd.Open(tgid, 0)
+    if err != nil {
+        logger.Fatal().Msgf("Error opening pidfd %v", err)
+    }
+
+    localFd, err := pfd.GetFd(int(fd), 0)
+    if err != nil {
+        logger.Fatal().Msgf("Error getting fd %v", err)
+    }
+    defer unix.Close(localFd)
+
+    // Get socket type to confirm it's TCP
+    sockType, err := syscall.GetsockoptInt(localFd, syscall.SOL_SOCKET, syscall.SO_TYPE)
+    if err != nil {
+        logger.Fatal().Msgf("Error getting socket type: %v", err)
+    }
+
+    if sockType != syscall.SOCK_STREAM {
+        logger.Info().Msgf("Not a TCP socket, allowing connection")
+        return 0, 0, unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE
+    }
+
+    // Allow the connection to proceed
+    logger.Info().Msgf("Allowing TCP DNS connection to proceed")
+    return 0, 0, unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE
+}
 func HandleSendto(seccompNotifFd libseccomp.ScmpFd, req *libseccomp.ScmpNotifReq) (uint64, int32, uint32) {
 	logger.Info().Msgf("Intercepted 'sento' syscall from PID %d", req.Pid)
 	err := libseccomp.NotifIDValid(seccompNotifFd, req.ID)
@@ -575,7 +621,134 @@ func HandleSendto(seccompNotifFd libseccomp.ScmpFd, req *libseccomp.ScmpNotifReq
 
 	return 0, 0, unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE
 }
+// HandleWritev intercepts writev syscalls to detect DNS over TCP
+func HandleWritev(seccompNotifFd libseccomp.ScmpFd, req *libseccomp.ScmpNotifReq) (uint64, int32, uint32) {
+    logger.Info().Msgf("Intercepted 'writev' syscall from PID %d", req.Pid)
+    err := libseccomp.NotifIDValid(seccompNotifFd, req.ID)
+    if err != nil {
+        logger.Fatal().Msgf("failed to validate notification ID: %v", err)
+    }
 
+    // Get the file descriptor being written to
+    fd := int(req.Data.Args[0])
+
+    // Get connection info to check if this is DNS (port 53)
+    tgid, err := getTgid(uint32(req.Pid))
+    if err != nil {
+        logger.Fatal().Msgf("Error getting tgid: %v", err)
+    }
+
+    pfd, err := pidfd.Open(tgid, 0)
+    if err != nil {
+        logger.Fatal().Msgf("Error opening pidfd %v", err)
+    }
+
+    localFd, err := pfd.GetFd(fd, 0)
+    if err != nil {
+        logger.Fatal().Msgf("Error getting fd %v", err)
+    }
+    defer unix.Close(localFd)
+
+    // Check if this is a DNS connection (port 53)
+    _, port, _, err := getConnectionInfo(localFd, true)
+    if err != nil {
+        if err == syscall.ENOTCONN {
+            return 0, 0, unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE
+        }
+        logger.Fatal().Msgf("Error getting connection info: %v", err)
+    }
+
+    if port != DNS_PORT {
+        return 0, 0, unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE
+    }
+
+    // Read the iovec array from memory
+    memFile := fmt.Sprintf("/proc/%d/mem", req.Pid)
+    mem, err := os.Open(memFile)
+    if err != nil {
+        logger.Fatal().Msgf("failed to open memory file: %v", err)
+    }
+    defer mem.Close()
+
+    // Read the iovec array (req.Data.Args[1] is the iov pointer, req.Data.Args[2] is count)
+    iovCount := int(req.Data.Args[2])
+    if iovCount <= 0 || iovCount > 1024 { // Sanity check
+        return 0, 0, unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE
+    }
+
+    iovArraySize := iovCount * binary.Size(iovec{})
+    iovArrayBytes, err := readBytes(mem, req.Data.Args[1], uint64(iovArraySize))
+    if err != nil {
+        logger.Fatal().Msgf("failed to read iovec array: %v", err)
+    }
+
+    // Parse each iovec and collect the data
+    var dnsData []byte
+    for i := 0; i < iovCount; i++ {
+        offset := i * binary.Size(iovec{})
+        var iov iovec
+        if err := binary.Read(bytes.NewReader(iovArrayBytes[offset:offset+binary.Size(iovec{})]), 
+            binary.LittleEndian, &iov); err != nil {
+            logger.Fatal().Msgf("failed to decode iovec: %v", err)
+        }
+
+        // Read the data from this iovec
+        data, err := readBytes(mem, iov.Base, iov.Len)
+        if err != nil {
+            logger.Fatal().Msgf("failed to read iovec data: %v", err)
+        }
+        dnsData = append(dnsData, data...)
+    }
+
+    // Process DNS message if we have enough data
+    if len(dnsData) >= DNS_HEADER_SIZE {
+        length := binary.BigEndian.Uint16(dnsData[:DNS_HEADER_SIZE])
+        if len(dnsData) >= int(length)+DNS_HEADER_SIZE {
+            dnsMsg := dnsData[DNS_HEADER_SIZE : DNS_HEADER_SIZE+length]
+            processDNSMessage(req.Pid, fmt.Sprintf("fd:%d", fd), dnsMsg)
+        }
+    }
+
+    return 0, 0, unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE
+}
+
+// Enhanced processDNSMessage to handle both UDP and TCP DNS
+func processDNSMessage(pid uint32, src string, dnsData []byte) {
+    var m dns.Msg
+    if err := m.Unpack(dnsData); err != nil {
+        logger.Error().Msgf("Failed to unpack DNS message from %s (PID %d): %v", src, pid, err)
+        return
+    }
+
+    if len(m.Question) > 0 {
+        // DNS query
+        for _, q := range m.Question {
+            logger.Info().Msgf("DNS query from PID %d via %s: %s %s", 
+                pid, src, q.Name, dns.TypeToString[q.Qtype])
+            
+            // Here you could implement DNS filtering/redirection
+            // Example: Redirect all .example.com queries
+            // if strings.HasSuffix(q.Name, ".example.com.") {
+            //     m.Question[0].Name = "safe.example.com."
+            //     // You would then need to modify the original buffer
+            // }
+        }
+    } else if len(m.Answer) > 0 {
+        // DNS response
+        for _, a := range m.Answer {
+            logger.Info().Msgf("DNS response to PID %d via %s: %s %s", 
+                pid, src, a.Header().Name, dns.TypeToString[a.Header().Rrtype])
+            
+            // Here you could implement response modification
+            // Example: Replace malicious IPs
+            // if a.Header().Rrtype == dns.TypeA {
+            //     if ip := a.(*dns.A).A; ip.Equal(net.ParseIP("1.2.3.4")) {
+            //         a.(*dns.A).A = net.ParseIP("127.0.0.1")
+            //     }
+            // }
+        }
+    }
+}
 func HandleSendmsg(seccompNotifFd libseccomp.ScmpFd, req *libseccomp.ScmpNotifReq) (uint64, int32, uint32) {
 	logger.Info().Msgf("Intercepted 'sendmsg' syscall from PID %d", req.Pid)
 	err := libseccomp.NotifIDValid(seccompNotifFd, req.ID)
