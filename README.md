@@ -1,5 +1,5 @@
 # SocksTrace
-A Golang-based proxy leak detector. Outreachy project.
+A seccomp-based proxy leak detector and proxifier, written in Go.
 
 ## Building
 Prerequisites:

@@ -265,7 +265,7 @@ var whitelist = []string{
 // Sets up the CLI command structure
 func setupCLI() {
 	const usage = `
-sockstrace is a tool to trace and monitor network connections made by a program,
+sockstrace is a seccomp-based proxy leak detector and proxifier.
 
 Usage:
 	sockstrace <program> [flags]
