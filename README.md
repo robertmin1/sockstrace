@@ -33,7 +33,7 @@ sudo dnf install libseccomp-devel
 go mod tidy
 ```
 
-3. Install `sockstrace` using `go build -o tracer main.go`
+3. Install `sockstrace` using `go build -o sockstrace main.go`
 
 
 ## Usage
