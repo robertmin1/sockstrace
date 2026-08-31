@@ -38,14 +38,20 @@ go mod tidy
 
 ## Usage
 Trace an application and log any leaks that occur:
-```
-./sockstrace <target application> --args "<target application argument>" --logleaks
-```
-For mutiple application arguments, use flag `args` for each argument:
-```
-./sockstrace wget --args "google.com" --args "--debug" --logleaks
+
+```bash
+./sockstrace <target application> [arguments]
+./sockstrace <target application> -- <arguments>
+./sockstrace <target application> --args "<argument>"
 ```
 
+Examples:
+
+```bash
+./sockstrace wget google.com
+./sockstrace wget -- google.com
+./sockstrace wget --logleaks -- google.com --debug
+```
 ### Optional tools
 
 To extract stack traces after a leak, gdb is required:

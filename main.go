@@ -268,13 +268,14 @@ func setupCLI() {
 sockstrace is a tool to trace and monitor network connections made by a program,
 
 Usage:
-	sockstrace <program> [flags]
-Examples:
-	sockstrace wget
-	sockstrace wget --args example.com
-	sockstrace wget --args "--directory-prefix=/home" --args="google.com" (Each argument must be passed separately)
-	sockstrace wget --args example.com --logleaks (Allow Proxy Leaks and log them)
+        sockstrace <program> [flags]
 
+Examples:
+        sockstrace wget example.com
+        sockstrace wget -- example.com
+        sockstrace wget --args example.com
+        sockstrace wget -- --directory-prefix=/home google.com
+        sockstrace wget example.com --logleaks
 Sources:
 	- CLI flags
 	- Environment variables (SOCKSTRACE_*) example: SOCKSTRACE_LOGLEAKS=true, SOCKSTRACE_KILL_PROG=true
@@ -282,7 +283,8 @@ Sources:
 
 Note:
 	- The first argument must always be the program you want to execute.
-	- Use --args to pass extra arguments to the program.
+	- Program arguments may be passed positionally or via --args.
+	- Use -- to separate sockstrace flags from program arguments.
 
 Flags:
 `
@@ -358,7 +360,19 @@ Flags:
 	}
 
 	bindConfigVars()
+
+	programArgs := Flags.Args()[1:]
+	args = resolveProgramArgs(args, programArgs, Flags.Changed("args"))
+
 	validateCLI()
+}
+
+func resolveProgramArgs(configArgs, programArgs []string, argsChanged bool) []string {
+	if !argsChanged && len(programArgs) > 0 {
+		return programArgs
+	}
+
+	return configArgs
 }
 
 var localDNSAddrUDP *unix.SockaddrInet4

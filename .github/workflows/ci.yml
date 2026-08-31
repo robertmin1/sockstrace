@@ -111,6 +111,9 @@ jobs:
           cd testdata
           go mod tidy
 
+      - name: Run Go tests
+        run: go test ./...
+
       - name: Start SOCKS5 server
         run: |
           (
@@ -121,17 +124,17 @@ jobs:
 
       - name: WGET SOCKS auth test
         run: |
-          ./sockstrace wget \
-            --args "https://check.torproject.org" \
-            --proxy-pass pass \
-            --proxy-user user
+            ./sockstrace wget \
+              --proxy-pass pass \
+              --proxy-user user \
+              -- https://check.torproject.org
 
       - name: CURL SOCKS auth test
         run: |
           ./sockstrace curl \
-            --args "https://check.torproject.org" \
             --proxy-pass pass \
-            --proxy-user user
+            --proxy-user user \
+            -- https://check.torproject.org -I
 
   firefox-webrtc-test:
     name: WebRTC Firefox Test
@@ -189,8 +192,8 @@ jobs:
         run: |
           echo "Testing Firefox via SOCKS5 proxy..."
           timeout 60 ./sockstrace firefox \
-            --args "https://browserleaks.com/webrtc" \
-            --args "-P" \
-            --args "proxy-profile" \
-            --args "--headless" \
-            --logleaks || [ $? -eq 124 ]
+            --logleaks \
+            -- https://browserleaks.com/webrtc \
+            -P proxy-profile \
+            --headless \
+            || [ $? -eq 124 ]
